@@ -1,0 +1,143 @@
+# Record and replay Go API tests with Keploy
+
+<p className="lede">I took Keploy's Echo + PostgreSQL quickstart, ran it on Windows with WSL2, and hit a handful of snags. This is the tutorial I wish I'd had: what each step does, why it matters, and how to get past the errors.</p>
+
+## Why Keploy
+
+Writing API tests by hand means writing requests, expected responses, and database fakes. Keploy skips most of that: you **use your app normally, and Keploy records the traffic** as test cases and mocks. Later it replays them and tells you if behaviour changed.
+
+For a Go developer this means regression tests for an Echo handler without writing a single test file and without needing a live database on every run.
+
+The diagram below is the whole idea. Press **Play**, then switch to the replay tab.
+
+<FlowDiagram />
+
+## My setup
+
+| Part | What I used |
+|---|---|
+| OS | Windows 10 |
+| Linux environment | WSL2, Ubuntu 22.04 |
+| Language and framework | Go 1.18.1, Echo v4.9.0 |
+| Database | PostgreSQL 10.5 |
+| Containers | Docker Desktop with WSL integration, Docker Compose |
+| Test tool | Keploy 3.8.58 |
+
+<Callout type="warn" title="Work inside the WSL filesystem">
+Cloning under `/mnt/c/...` failed with `chmod ... Operation not permitted`. Keep the project in your Linux home (`~/samples-go`) instead. Also, Windows Defender flagged the Windows Keploy binary, so I used the Linux build inside WSL rather than turning Defender off.
+</Callout>
+
+Install Keploy inside WSL and sign in when prompted:
+
+```bash
+curl --silent -O -L https://keploy.io/install.sh && source install.sh
+```
+
+## Run the app
+
+The sample is a tiny URL shortener: `POST /url` stores a long URL in PostgreSQL and returns a short one.
+
+```bash
+git clone https://github.com/keploy/samples-go.git
+cd samples-go/echo-sql
+docker compose up -d
+```
+
+Compose starts two containers: `echoApp` and `postgresDb`. Now call the API.
+
+<Callout type="tip" title="Two traps I fell into">
+I first tried `localhost:8080`. The logs said `HTTP server started on [::]:8082`, so the port is **8082**. And `GET /` returns `{"message":"Not Found"}` because `/` isn't a route. That's normal. The README shows the real endpoint is `POST /url`.
+</Callout>
+
+```bash
+curl --request POST \
+  --url http://localhost:8082/url \
+  --header 'content-type: application/json' \
+  --data '{"url":"https://google.com"}'
+```
+
+You should get back a JSON body with a `ts` and a short `url`. Stop the stack before recording: `docker compose down`.
+
+## Record
+
+```bash
+keploy record -c "docker compose up" --container-name echoApp
+```
+
+`-c` is how Keploy starts your app. `--container-name` tells it which container is the app. Without it, replay later fails with `container name not found`.
+
+With recording running, send the same `curl` request again. Keploy captures the request, the app's response, and the PostgreSQL traffic in between. Stop it with `Ctrl+C`.
+
+<Callout type="info" title="If recording dies">
+My app container stopped mid-recording once, because old containers were still around. Removing them and restarting the recording fixed it.
+</Callout>
+
+## What was recorded
+
+```text
+keploy/
+├── test-set-0/
+│   ├── tests/test-1.yaml   # request + expected response
+│   ├── mocks.yaml          # recorded PostgreSQL exchanges
+│   ├── mappings.yaml
+│   └── config.yaml
+└── reports/
+```
+
+`test-1.yaml` holds the method (`POST`), URL, body, and the expected `200` response. `mocks.yaml` is the "a-ha": the database conversation is saved, so replay doesn't depend on live data.
+
+## Replay
+
+```bash
+keploy test -c "docker compose up" \
+  --container-name echoApp \
+  --mappings \
+  --compose-deps
+```
+
+`--compose-deps` lets Keploy start `postgresDb` itself. Before I added it, the app failed with a `lookup postgresDb` error. Expected result:
+
+```text
+Total tests: 1
+Passed:      1
+Failed:      0
+```
+
+Keploy ended in the `verified_green` state, and the report at `keploy/reports/test-run-1/test-set-0-report.yaml` shows `status: PASSED`.
+
+<Callout type="info" title="Mock warnings are not failures">
+I saw PostgreSQL mock warnings during replay. I checked the final result instead of assuming a failure, and it was green.
+</Callout>
+
+## How it compares
+
+The replayed `ts` was `1790965823695936000`, not the recorded `1716546241744809281`. A naive test would fail. Keploy treats `body.ts` and the `Date` header as **noise** and ignores them. Toggle it:
+
+<NoiseDemo />
+
+## Regression lesson
+
+I wanted to prove Keploy catches bugs, so I changed `localhost:8082` to `localhost:8083` in the source. The test **still passed**.
+
+<Callout type="lesson" title="Rebuild your image">
+The container was running the old Docker image, so my edit never ran. I can't claim Keploy caught that bug, but the lesson is real: after changing Go code, rebuild (`docker compose up --build`) before testing. Try the 8083 change again with a rebuild and the `url` field should differ from the recording. I haven't verified that run, so treat it as an exercise.
+</Callout>
+
+## Issues and fixes
+
+<Issue title="Windows Defender flagged the Keploy binary" fix="Didn't disable Defender. Used Keploy inside WSL." />
+<Issue title="git clone failed in /mnt/c" fix="Clone inside WSL home: ~/samples-go." />
+<Issue title="Connection failed on port 8080" fix="App logs showed 8082." />
+<Issue title="/ returned Not Found" fix="The endpoint is POST /url." />
+<Issue title="keploy record wanted a command" fix='Pass -c "docker compose up".' />
+<Issue title="container name not found" fix="Add --container-name echoApp." />
+<Issue title="App stopped during recording" fix="Remove old containers and record again." />
+<Issue title="Keploy couldn't resolve postgresDb" fix="Start PostgreSQL or use --compose-deps." />
+<Issue title="PostgreSQL mock warnings" fix="Read the final report before assuming failure." />
+<Issue title="Pasted logs landed in the terminal" fix="Ctrl+C, then rerun the command." />
+
+## Recap
+
+I ran the Echo + PostgreSQL app with Docker Compose, recorded a `POST /url` call plus its database traffic, and replayed it with Keploy. Noisy values like timestamps were ignored, and the run finished 1/1 passing at `verified_green`.
+
+Next steps: record more requests, add them to CI, and explore other Go quickstarts.
